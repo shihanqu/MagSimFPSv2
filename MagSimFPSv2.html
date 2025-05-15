@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Magnetic Physics Shooter - Rapier.js</title>
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0" />
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <style>
+      body { margin: 0; overflow: hidden; font-family: monospace; }
+      #instructions { position: fixed; left:0;top:0;width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;background-color:rgba(0,0,0,0.7);color:#fff;text-align:center;cursor:pointer;z-index:1001; }
+      #instructions span { font-size: 30px; }
+      #infoDisplay { position:fixed;top:10px;left:10px;padding:8px;background-color:rgba(0,0,0,0.6);color:#fff;font-size:12px;z-index:100; }
+      #simulationStatus { position:fixed;top:10px;right:10px;padding:8px;background-color:rgba(0,0,0,0.6);color:#fff;font-size:12px;z-index:100; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.122.0/build/three.module.js",
+          "rapier3d-compat": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.11.2/rapier.es.js",
+          "three/addons/controls/PointerLockControls.js": "https://unpkg.com/three@0.122.0/examples/jsm/controls/PointerLockControls.js"
+        }
+      }
+    </script>
+</head>
+<body>
+    <div id="instructions">
+      {/* Content will be updated by script */}
+    </div>
+    <div id="infoDisplay">Magnetism: ON<br />Active Magnetic Pairs: 0</div>
+    <div id="simulationStatus">Status: Running</div>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import RAPIER from 'rapier3d-compat';
+      import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+      const DEBUG_LOG_CALCULATIONS = false; 
+      const DEBUG_DISABLE_TORQUE_APPLICATION = false;
+      const DEBUG_DISABLE_FORCE_APPLICATION = false;
+
+      let camera, scene, renderer, generalThreeMaterial, physicsWorld, controls;
+      const timeStep = 1/60;
+      let lastCallTime = performance.now()/1000, physicsPaused = false, stepPhysics = false;
+      let playerBody, ballMaterialOriginal, ballMaterialRed;
+      const playerHeight = 1.7, playerRadius = 0.4;
+      let ballRadius = 0.3; 
+      const dynamicObjects = [];
+      const instructions = document.getElementById('instructions');
+      const infoDisplayElement = document.getElementById('infoDisplay');
+      const simulationStatusElement = document.getElementById('simulationStatus');
+      let activeMagneticPairs = 0;
+
+      const MU0_4PI = 1e-7;
+      const MAGNETIC_STRENGTH_BALL = 200;
+      let magnetismEnabled = true;
+      const shootVelocity = 15;
+
+      const APPLY_FORCE_CAP = true;
+      const MAX_APPLIED_FORCE = 100, MAX_APPLIED_TORQUE = 50;  
+
+      const moveState = { forward:0, backward:0, left:0, right:0, jump:false };
+      const playerVelocity = new THREE.Vector3(); // For storing player input direction related to camera
+      const playerMoveSpeed = 50, playerJumpStrength = 8;
+
+      // General purpose temporary Three.js objects
+      const tempThreeVec1 = new THREE.Vector3(), tempThreeVec2 = new THREE.Vector3(), tempThreeVec3 = new THREE.Vector3(); 
+      const tempThreeQuat = new THREE.Quaternion();
+
+      // Temporary objects specifically for magnetic calculations
+      const magCalc = { 
+          posA:new THREE.Vector3(), posB:new THREE.Vector3(), 
+          rotA:new THREE.Quaternion(), rotB:new THREE.Quaternion(), 
+          localPoleA:new THREE.Vector3(), localPoleB:new THREE.Vector3(), 
+          mA:new THREE.Vector3(), mB:new THREE.Vector3(), 
+          rAB:new THREE.Vector3(), rBA:new THREE.Vector3(), 
+          B_AatB:new THREE.Vector3(), B_BatA:new THREE.Vector3(), 
+          forceOnB:new THREE.Vector3(), 
+          torqueOnA:new THREE.Vector3(), torqueOnB:new THREE.Vector3(), 
+          term1:new THREE.Vector3(), term2:new THREE.Vector3(), 
+          term3:new THREE.Vector3(), term4:new THREE.Vector3() 
+      };
+
+      // --- Define Spawn Scenarios ---
+      const ySpawnPos = 0.1 + ballRadius; 
+      const spawnSpacing = 1.0; 
+
+      const R_HELPER = (rotData) => { // Helper to create Quaternion from compact data
+        if (!rotData) return new THREE.Quaternion(); // Identity
+        // Assumes rotData is [dirX, dirY, dirZ] to align local (0,1,0) pole to
+        if (rotData.length === 3) { 
+            const targetDir = tempThreeVec1.set(rotData[0], rotData[1], rotData[2]).normalize();
+            const localPole = tempThreeVec2.set(0,1,0); 
+            return new THREE.Quaternion().setFromUnitVectors(localPole, targetDir);
+        }
+        // Fallback for older axis-angle format if needed, or just identity
+        if (rotData.length === 4) return new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(rotData[0], rotData[1], rotData[2]), rotData[3]);
+        return new THREE.Quaternion(); 
+      };
+
+      const spawnScenarios = [
+        { name: "Attract Head-Tail", key: 'KeyT', balls: [ { pos: [-spawnSpacing, ySpawnPos, 0], rot: [1,0,0] }, { pos: [spawnSpacing,  ySpawnPos, 0], rot: [1,0,0] } ] },
+        { name: "Repel Head-Head", key: 'KeyR', balls: [ { pos: [-spawnSpacing, ySpawnPos, 0], rot: [1,0,0] }, { pos: [spawnSpacing,  ySpawnPos, 0], rot: [-1,0,0] } ] },
+        { name: "Side Repel (N away)", key: 'KeyF', balls: [ { pos: [-spawnSpacing/2, ySpawnPos, 0], rot: [0,0,1] }, { pos: [spawnSpacing/2, ySpawnPos, 0], rot: [0,0,1] } ] },
+        { name: "Side Attract (N away, S away)", key: 'KeyG', balls: [ { pos: [-spawnSpacing/2, ySpawnPos, 0], rot: [0,0,1] }, { pos: [spawnSpacing/2, ySpawnPos, 0], rot: [0,0,-1] } ] },
+        { name: "Vertical Attract (N up, N down)", key: 'KeyB', balls: [ { pos: [-spawnSpacing/2, ySpawnPos, 0], rot: [0,1,0] }, { pos: [spawnSpacing/2, ySpawnPos, 0], rot: [0,-1,0] } ] },
+        { name: "Random Pair", key: 'KeyV', balls: [ { pos: [-spawnSpacing/2, ySpawnPos, 0], rot: 'random' }, { pos: [spawnSpacing/2, ySpawnPos, 0], rot: 'random' } ] }
+      ];
+      
+      function updateInstructionsText() {
+        const base=`<span>Click to play</span><br/>(W,A,S,D=Move,SPACE=Jump,MOUSE=Look,CLICK=Shoot,M=Toggle Magnetism)<br/>`;
+        const keys=spawnScenarios.map(s=>`${s.key.replace('Key','')}="${s.name.split('(')[0].trim()}"`).join(', ');
+        instructions.innerHTML = `${base}(${keys})<br/>(P=Pause/Play,O=Step Physics)`;
+      }
+
+      await RAPIER.init();
+      initThree(); initRapier(); initPlayerControls();
+      updateInfoDisplay(); updateSimulationStatus(); updateInstructionsText();
+      animate();
+
+      function updateInfoDisplay() { infoDisplayElement.innerHTML = `Magnetism: ${magnetismEnabled ? 'ON':'OFF'}<br />Active Magnetic Pairs: ${activeMagneticPairs}`; }
+      function updateSimulationStatus() { simulationStatusElement.textContent = `Status: ${physicsPaused?'Paused':'Running'}`; }
+
+      function initThree() {
+        camera = new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,1000);
+        scene = new THREE.Scene(); scene.fog = new THREE.Fog(0x000000,0,500);
+        renderer = new THREE.WebGLRenderer({antialias:true});
+        renderer.setSize(window.innerWidth,window.innerHeight); renderer.setClearColor(scene.fog.color);
+        renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap; document.body.appendChild(renderer.domElement);
+        scene.add(new THREE.AmbientLight(0xffffff,0.1));
+        const spotlight = new THREE.SpotLight(0xffffff,0.9,0,Math.PI/4,1); 
+        spotlight.position.set(10,30,20); spotlight.castShadow=true; scene.add(spotlight);
+        generalThreeMaterial = new THREE.MeshLambertMaterial({color:0xdddddd});
+        const floorGeo = new THREE.PlaneBufferGeometry(300,300,100,100); floorGeo.rotateX(-Math.PI/2);
+        const floorMesh = new THREE.Mesh(floorGeo,generalThreeMaterial); floorMesh.receiveShadow=true; scene.add(floorMesh);
+        scene.add(new THREE.GridHelper(300,30,0x333333,0x333333).translateY(0.01));
+        camera.position.set(0,5,10);camera.lookAt(0,0,0);
+        window.addEventListener('resize',()=>{camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);});
+      }
+
+      function initRapier() {
+        physicsWorld=new RAPIER.World(new RAPIER.Vector3(0.0,-9.81,0.0));
+        const groundBody = physicsWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0,-0.1,0));
+        physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(150,0.1,150),groundBody);
+        playerBody=physicsWorld.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(0,playerHeight,5).setLinearDamping(0.5).setAngularDamping(1.0).lockRotations());
+        physicsWorld.createCollider(RAPIER.ColliderDesc.capsule(playerHeight/2-playerRadius,playerRadius).setRestitution(0.1).setFriction(0.5),playerBody);
+        const boxGeo = new THREE.BoxBufferGeometry(2,2,2);
+        for(let i=0;i<2;i++){const mesh=new THREE.Mesh(boxGeo,generalThreeMaterial);mesh.castShadow=true;scene.add(mesh);const body=physicsWorld.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation((Math.random()-0.5)*10,5+(Math.random()-0.5)*1,(Math.random()-0.5)*10-5));physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(1,1,1).setDensity(1.0),body);dynamicObjects.push({mesh,body});}
+        ballMaterialOriginal=new THREE.MeshLambertMaterial({color:0xdddddd,transparent:true,opacity:0.8}); 
+        ballMaterialRed=new THREE.MeshLambertMaterial({color:0xff0000,transparent:true,opacity:0.8});
+        window.addEventListener('click',shootBall);
+      }
+
+      function createMagneticBall(position, initialVelocity = new THREE.Vector3(), initialRotationQuat = new THREE.Quaternion()) {
+        const geom = new THREE.SphereBufferGeometry(ballRadius,16,16); geom.clearGroups();
+        const halfIndices = Math.floor(Math.floor(geom.index.array.length/2)/3)*3;
+        geom.addGroup(0,halfIndices,1); geom.addGroup(halfIndices,geom.index.array.length-halfIndices,0);
+        const mesh = new THREE.Mesh(geom,[ballMaterialOriginal,ballMaterialRed]); mesh.castShadow=true; scene.add(mesh);
+        const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(position.x,position.y,position.z).setLinvel(initialVelocity.x,initialVelocity.y,initialVelocity.z).setAngvel({x:0,y:0,z:0}).setAdditionalMass(0.5).setLinearDamping(0.8).setAngularDamping(0.8);
+        const body = physicsWorld.createRigidBody(bodyDesc);
+        body.userData={localMagneticPoleAxis:new RAPIER.Vector3(0,1,0)};
+        body.setRotation({x:initialRotationQuat.x,y:initialRotationQuat.y,z:initialRotationQuat.z,w:initialRotationQuat.w},true);
+        physicsWorld.createCollider(RAPIER.ColliderDesc.ball(ballRadius).setDensity(1.0).setRestitution(0.5),body);
+        dynamicObjects.push({mesh,body,isMagneticBall:true});
+      }
+
+      function shootBall() {if(!controls.isLocked)return;camera.getWorldDirection(tempThreeVec1);tempThreeVec2.copy(camera.position).addScaledVector(tempThreeVec1,playerRadius*1.5+ballRadius);tempThreeQuat.setFromUnitVectors(tempThreeVec3.set(0,1,0),tempThreeVec1);createMagneticBall(tempThreeVec2,tempThreeVec1.clone().multiplyScalar(shootVelocity),tempThreeQuat);}
+      function clearDebugBalls() {for(let i=dynamicObjects.length-1;i>=0;i--){const o=dynamicObjects[i];if(o.isMagneticBall){if(o.mesh?.parent)scene.remove(o.mesh);if(o.body&&physicsWorld.getRigidBody(o.body.handle))physicsWorld.removeRigidBody(o.body);dynamicObjects.splice(i,1);}}}
+
+      function spawnDebugScenario(scenario) {
+        clearDebugBalls(); console.log(`Spawning: ${scenario.name}`);
+        scenario.balls.forEach(ballConf => {
+            const pos = new THREE.Vector3().fromArray(ballConf.pos); // Convert array to Vector3
+            let rot;
+            if (ballConf.rot === 'random') {
+                rot = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.random()*2*Math.PI,Math.random()*2*Math.PI,Math.random()*2*Math.PI));
+            } else {
+                rot = R_HELPER(ballConf.rot); // Use the helper to convert array/data to Quaternion
+            }
+            createMagneticBall(pos, undefined, rot); // Pass undefined for velocity, createMagneticBall handles default
+        });
+      }
+      
+      function initPlayerControls() {
+        controls=new PointerLockControls(camera,renderer.domElement);instructions.addEventListener('click',()=>controls.lock());
+        controls.addEventListener('lock',()=>{instructions.style.display='none';if(!physicsPaused){const p=playerBody.translation();camera.position.set(p.x,p.y+playerHeight/2-playerRadius*0.1,p.z);}});
+        controls.addEventListener('unlock',()=>{instructions.style.display='flex';if(!physicsPaused){physicsPaused=true;updateSimulationStatus();}});
+        const keyActions={KeyP:()=>{physicsPaused=!physicsPaused;updateSimulationStatus()},KeyO:()=>{if(physicsPaused)stepPhysics=true;},KeyW:()=>{moveState.forward=1},KeyA:()=>{moveState.left=1},KeyS:()=>{moveState.backward=1},KeyD:()=>{moveState.right=1},Space:()=>{moveState.jump=true},KeyM:()=>{magnetismEnabled=!magnetismEnabled;updateInfoDisplay()}};
+        spawnScenarios.forEach(s=>{keyActions[s.key]=()=>spawnDebugScenario(s);}); // Dynamically add scenario keys
+        const keyUpActions={KeyW:()=>{moveState.forward=0},KeyA:()=>{moveState.left=0},KeyS:()=>{moveState.backward=0},KeyD:()=>{moveState.right=0}};
+        document.addEventListener('keydown',e=>{const action=keyActions[e.code];if(action)action();}); 
+        document.addEventListener('keyup',e=>{const action=keyUpActions[e.code];if(action)action();});
+      }
+
+    function updatePlayer(dt_wall) {
+        if(!controls.isLocked||!playerBody)return;playerVelocity.set(0,0,0);
+        if(moveState.forward)playerVelocity.z=-1;if(moveState.backward)playerVelocity.z=1;if(moveState.left)playerVelocity.x=-1;if(moveState.right)playerVelocity.x=1;
+        const playerIsMovingInput=playerVelocity.lengthSq()>0;
+        if(playerIsMovingInput)camera.position.addScaledVector(tempThreeVec1.copy(playerVelocity).applyQuaternion(camera.quaternion).normalize(),playerMoveSpeed*0.1*dt_wall);
+        if(!physicsPaused||stepPhysics){if(playerIsMovingInput)playerBody.applyImpulse(tempThreeVec3.copy(playerVelocity).applyQuaternion(camera.quaternion).normalize().multiplyScalar(playerMoveSpeed*timeStep).setY(0),true);if(moveState.jump&&Math.abs(playerBody.linvel().y)<0.5)playerBody.applyImpulse({x:0,y:playerJumpStrength,z:0},true);}
+        if((!physicsPaused||stepPhysics)||!controls.isLocked)moveState.jump=false;
+    }
+      
+    function processMagneticInteractions() {
+        if(!magnetismEnabled){activeMagneticPairs=0;return;}activeMagneticPairs=0;const magneticBalls=dynamicObjects.filter(o=>o.isMagneticBall);if(magneticBalls.length<2)return;
+        const epsilonSq=1e-12,minForceDistSq=Math.pow(ballRadius*2*1.2,2);
+
+        for(let i=0;i<magneticBalls.length;i++){
+            const objA=magneticBalls[i],bodyA=objA.body; if(!bodyA.userData?.localMagneticPoleAxis)continue;
+            const pA=bodyA.translation(),rA=bodyA.rotation();magCalc.posA.set(pA.x,pA.y,pA.z); magCalc.rotA.set(rA.x,rA.y,rA.z,rA.w);
+            magCalc.mA.set(bodyA.userData.localMagneticPoleAxis.x,bodyA.userData.localMagneticPoleAxis.y,bodyA.userData.localMagneticPoleAxis.z).applyQuaternion(magCalc.rotA).multiplyScalar(MAGNETIC_STRENGTH_BALL);
+
+            for(let j=i+1;j<magneticBalls.length;j++){
+                const objB=magneticBalls[j],bodyB=objB.body; if(!bodyB.userData?.localMagneticPoleAxis)continue;activeMagneticPairs++;
+                const pB=bodyB.translation(),rB=bodyB.rotation();magCalc.posB.set(pB.x,pB.y,pB.z);magCalc.rotB.set(rB.x,rB.y,rB.z,rB.w);
+                magCalc.mB.set(bodyB.userData.localMagneticPoleAxis.x,bodyB.userData.localMagneticPoleAxis.y,bodyB.userData.localMagneticPoleAxis.z).applyQuaternion(magCalc.rotB).multiplyScalar(MAGNETIC_STRENGTH_BALL);
+
+                magCalc.rAB.subVectors(magCalc.posB,magCalc.posA); let rsq=magCalc.rAB.lengthSq();
+                if(rsq<epsilonSq)continue; if(rsq<minForceDistSq)rsq=minForceDistSq;
+                const r=Math.sqrt(rsq), r5=rsq*rsq*r,mA_r=magCalc.mA.dot(magCalc.rAB);
+                magCalc.term1.copy(magCalc.rAB).multiplyScalar(3*mA_r);magCalc.term2.copy(magCalc.mA).multiplyScalar(rsq);
+                magCalc.B_AatB.subVectors(magCalc.term1,magCalc.term2).multiplyScalar(MU0_4PI/r5);
+                magCalc.torqueOnB.crossVectors(magCalc.mB,magCalc.B_AatB);
+
+                magCalc.rBA.copy(magCalc.rAB).negate();const mB_r=magCalc.mB.dot(magCalc.rBA);magCalc.term1.copy(magCalc.rBA).multiplyScalar(3*mB_r);magCalc.term2.copy(magCalc.mB).multiplyScalar(rsq);magCalc.B_BatA.subVectors(magCalc.term1,magCalc.term2).multiplyScalar(MU0_4PI/r5);magCalc.torqueOnA.crossVectors(magCalc.mA,magCalc.B_BatA);
+
+                const mB_rAB=magCalc.mB.dot(magCalc.rAB),mA_mB=magCalc.mA.dot(magCalc.mB);magCalc.term1.copy(magCalc.mB).multiplyScalar(mA_r);magCalc.term2.copy(magCalc.mA).multiplyScalar(mB_rAB);magCalc.term3.copy(magCalc.rAB).multiplyScalar(mA_mB);magCalc.term4.copy(magCalc.rAB).multiplyScalar(-5*mA_r*mB_rAB/rsq);
+                magCalc.forceOnB.set(0,0,0).add(magCalc.term1).add(magCalc.term2).add(magCalc.term3).add(magCalc.term4).multiplyScalar((3*MU0_4PI)/r5);
+                
+                if(APPLY_FORCE_CAP){if(magCalc.forceOnB.lengthSq()>MAX_APPLIED_FORCE*MAX_APPLIED_FORCE)magCalc.forceOnB.normalize().multiplyScalar(MAX_APPLIED_FORCE);if(magCalc.torqueOnA.lengthSq()>MAX_APPLIED_TORQUE*MAX_APPLIED_TORQUE)magCalc.torqueOnA.normalize().multiplyScalar(MAX_APPLIED_TORQUE);if(magCalc.torqueOnB.lengthSq()>MAX_APPLIED_TORQUE*MAX_APPLIED_TORQUE)magCalc.torqueOnB.normalize().multiplyScalar(MAX_APPLIED_TORQUE);}
+                if(!DEBUG_DISABLE_FORCE_APPLICATION){bodyA.addForce({x:-magCalc.forceOnB.x,y:-magCalc.forceOnB.y,z:-magCalc.forceOnB.z},true); bodyB.addForce(magCalc.forceOnB,true);}
+                if(!DEBUG_DISABLE_TORQUE_APPLICATION){bodyA.addTorque(magCalc.torqueOnA,true); bodyB.addTorque(magCalc.torqueOnB,true);}
+                
+                if(DEBUG_LOG_CALCULATIONS&&activeMagneticPairs<=1)console.log(`P(${bodyA.handle},${bodyB.handle}):F(${magCalc.forceOnB.length().toFixed(1)})TA(${magCalc.torqueOnA.length().toFixed(1)})TB(${magCalc.torqueOnB.length().toFixed(1)})`);
+            }
+        }
+    }
+
+      function animate() {
+        requestAnimationFrame(animate);const t=performance.now()/1000;let dt_wall=t-lastCallTime;lastCallTime=t;
+        if(controls.isLocked)updatePlayer(dt_wall); 
+        if(physicsPaused&&!stepPhysics){for(const o of dynamicObjects){if(!o.body||!physicsWorld.getRigidBody(o.body.handle))continue; const{x,y,z}=o.body.translation(),{x:qx,y:qy,z:qz,w:qw}=o.body.rotation();o.mesh.position.set(x,y,z);o.mesh.quaternion.set(qx,qy,qz,qw);}renderer.render(scene,camera);return;}
+        processMagneticInteractions();physicsWorld.step();if(stepPhysics)stepPhysics=false;
+        if(!physicsPaused&&controls.isLocked){const p=playerBody.translation();camera.position.set(p.x,p.y+playerHeight/2-playerRadius*0.1,p.z);}
+        for(const o of dynamicObjects){if(!o.body||!physicsWorld.getRigidBody(o.body.handle))continue; const{x,y,z}=o.body.translation(),{x:qx,y:qy,z:qz,w:qw}=o.body.rotation();o.mesh.position.set(x,y,z);o.mesh.quaternion.set(qx,qy,qz,qw);}
+        renderer.render(scene,camera);updateInfoDisplay();
+      }
+    </script>
+</body>
+</html>
